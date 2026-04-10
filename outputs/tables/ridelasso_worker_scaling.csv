@@ -1,0 +1,11 @@
+Model,Workers,CV_Time_sec,OOS_Time_sec,Total_Time_sec
+Ridge,1,7.36,8.84,16.2
+Lasso,1,6.47,9.44,15.91
+Ridge,2,4.84,4.54,9.38
+Lasso,2,4.69,4.93,9.61
+Ridge,4,4.71,2.57,7.28
+Lasso,4,3.98,2.74,6.73
+Ridge,8,4.49,1.46,5.95
+Lasso,8,3.84,1.62,5.46
+Ridge,16,3.64,1.02,4.66
+Lasso,16,3.6,1.12,4.72
