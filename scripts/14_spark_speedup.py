@@ -47,7 +47,7 @@ print(pivot.to_string(float_format='{:.2f}'.format))
 fig, ax = plt.subplots(figsize=(12, 7))
 colors = {'FamaMacBeth': '#3498db', 'Ridge': '#2ecc71', 'Lasso': '#e74c3c', 'NN_64_32': '#9b59b6'}
 for model in models:
-    model_data = speedup_df[speedup_df['Model'] == model]
+    model_data = speedup_df[speedup_df['Model'] == model].sort_values('Cores')
     ax.plot(model_data['Cores'], model_data['Speedup'], 'o-', label=model, linewidth=2, markersize=8, color=colors.get(model, 'gray'))
 ax.plot(core_counts, core_counts, 'k--', linewidth=1, label='Ideal Linear', alpha=0.5)
 ax.set_xlabel('Number of Cores', fontsize=12)
@@ -63,7 +63,7 @@ plt.close()
 
 fig, ax = plt.subplots(figsize=(12, 7))
 for model in models:
-    model_data = speedup_df[speedup_df['Model'] == model]
+    model_data = speedup_df[speedup_df['Model'] == model].sort_values('Cores')
     ax.plot(model_data['Cores'], model_data['Time_sec'], 'o-', label=model, linewidth=2, markersize=8, color=colors.get(model, 'gray'))
 ax.set_xlabel('Number of Cores', fontsize=12)
 ax.set_ylabel('Time (seconds)', fontsize=12)
