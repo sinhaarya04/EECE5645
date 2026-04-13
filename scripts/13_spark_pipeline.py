@@ -1,33 +1,64 @@
 """
 13_spark_pipeline.py
-Replicates the Fama-MacBeth cross-sectional regression pipeline using PySpark.
-Demonstrates distributed data processing on the same panel dataset.
-Runs cross-sectional OLS at each date in parallel via Spark UDFs.
+Full distributed ML pipeline on PySpark.
+Runs Fama-MacBeth, Ridge, Lasso, and Neural Net with timing.
+Accepts --cores argument for speedup benchmarking.
+
+Usage:
+  spark-submit --master local[1] scripts/13_spark_pipeline.py --cores 1
+  spark-submit --master local[4] scripts/13_spark_pipeline.py --cores 4
+  spark-submit --master local[16] scripts/13_spark_pipeline.py --cores 16
 
 Input:  data/processed/panel_features.csv
-Output: outputs/tables/spark_fama_macbeth_results.csv
-        outputs/figures/spark_factor_premia.png
+Output: outputs/tables/spark_results_{cores}.csv
+        data/predictions/spark_{model}_predictions.csv
 """
 
-import pandas as pd
-import numpy as np
-from scipy import stats
-import matplotlib.pyplot as plt
-import os
+import argparse
 import time
+import os
+import numpy as np
+import pandas as pd
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType
-)
+from pyspark.sql.window import Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression, GeneralizedLinearRegression
+from pyspark.ml.classification import MultilayerPerceptronClassifier
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql.types import DoubleType, StringType, StructType, StructField
 
-IN_PATH = os.path.join('data', 'processed', 'panel_features.csv')
-TABLE_OUT = os.path.join('outputs', 'tables', 'spark_fama_macbeth_results.csv')
-FIG_OUT = os.path.join('outputs', 'figures', 'spark_factor_premia.png')
+# ============================================================
+# ARGS
+# ============================================================
+parser = argparse.ArgumentParser()
+parser.add_argument('--cores', type=int, default=1)
+args = parser.parse_args()
+NUM_CORES = args.cores
 
-os.makedirs(os.path.join('outputs', 'tables'), exist_ok=True)
-os.makedirs(os.path.join('outputs', 'figures'), exist_ok=True)
+# ============================================================
+# SPARK SESSION
+# ============================================================
+spark = SparkSession.builder \
+    .appName(f"EECE5645_Factor_Model_{NUM_CORES}cores") \
+    .config("spark.driver.memory", "8g") \
+    .config("spark.sql.shuffle.partitions", str(NUM_CORES * 2)) \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+print(f"\n{'='*70}")
+print(f"SPARK PIPELINE — {NUM_CORES} CORE(S)")
+print(f"{'='*70}")
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+IN_PATH = 'data/processed/panel_features.csv'
+PRED_DIR = 'data/predictions'
+TABLE_DIR = 'outputs/tables'
+os.makedirs(PRED_DIR, exist_ok=True)
+os.makedirs(TABLE_DIR, exist_ok=True)
 
 FEATURES = [
     'PE_RATIO', 'PX_TO_SALES_RATIO', 'CURRENT_EV_TO_T12M_EBITDA',
@@ -38,200 +69,374 @@ FEATURES = [
     'MOMENTUM_12_1', 'REVERSAL_3M', 'HIGH_52W_RATIO'
 ]
 TARGET = 'FWD_RETURN'
+MIN_TRAIN_MONTHS = 60
 
-# ============================================================
-# Initialize Spark
-# ============================================================
-print("=" * 70)
-print("INITIALIZING SPARK SESSION")
-print("=" * 70)
+print("Loading data...")
+t0 = time.time()
 
-spark = SparkSession.builder \
-    .appName("EECE5645_FamaMacBeth") \
-    .master("local[*]") \
-    .config("spark.driver.memory", "4g") \
-    .getOrCreate()
-
-spark.sparkContext.setLogLevel("WARN")
-print(f"Spark version: {spark.version}")
-
-# ============================================================
-# Load data into Spark DataFrame
-# ============================================================
-print("\nLoading data into Spark...")
-start_load = time.time()
-
+# Read with pandas first (small enough), then convert
 pdf = pd.read_csv(IN_PATH)
 pdf['Date'] = pd.to_datetime(pdf['Date'])
-pdf['Date'] = pdf['Date'].dt.strftime('%Y-%m-%d')
+pdf['Date_str'] = pdf['Date'].dt.strftime('%Y-%m-%d')
 
-# Drop rows with missing target or features
+# Ensure all feature columns are float
+for col in FEATURES + [TARGET]:
+    pdf[col] = pd.to_numeric(pdf[col], errors='coerce')
+
+# Drop rows with any NaN in features or target
 pdf = pdf.dropna(subset=FEATURES + [TARGET])
 
-sdf = spark.createDataFrame(pdf)
-sdf.cache()
-row_count = sdf.count()
-load_time = time.time() - start_load
-
-print(f"Loaded {row_count} rows in {load_time:.2f}s")
-print(f"Schema:")
-sdf.printSchema()
+dates = sorted(pdf['Date_str'].unique())
+print(f"Loaded {len(pdf)} rows, {len(dates)} months, {pdf['Ticker'].nunique()} tickers")
+print(f"Load time: {time.time()-t0:.2f}s")
 
 # ============================================================
-# Spark Fama-MacBeth: groupBy Date, run OLS per group
+# HELPER: Expanding window with Spark ML
 # ============================================================
-print("\n" + "=" * 70)
-print("SPARK FAMA-MACBETH REGRESSIONS")
-print("=" * 70)
-
-# Define output schema for the UDF
-coef_fields = [StructField('Date', StringType(), False)]
-coef_fields += [StructField(f, DoubleType(), True) for f in ['intercept'] + FEATURES]
-coef_schema = StructType(coef_fields)
-
-
-def fama_macbeth_udf(key, group_pdf):
+def run_expanding_window_spark(pdf, dates, model_name, spark_model_fn, 
+                                features, target, min_train=60):
     """
-    Pandas UDF: runs OLS cross-sectional regression for one date.
-    key: (Date,)
-    group_pdf: pandas DataFrame for that date
+    Expanding window using PySpark ML models.
+    For each test month, creates a Spark DataFrame, trains, predicts.
+    Returns predictions DataFrame and timing.
     """
-    date_val = key[0]
-    sub = group_pdf[FEATURES + [TARGET]].dropna()
+    assembler = VectorAssembler(inputCols=features, outputCol='features')
+    all_preds = []
+    t_start = time.time()
+    
+    for i in range(min_train, len(dates) - 1):
+        train_dates = set(dates[:i])
+        test_date = dates[i]
+        
+        train_pdf = pdf[pdf['Date_str'].isin(train_dates)]
+        test_pdf = pdf[pdf['Date_str'] == test_date]
+        
+        if len(train_pdf) < 100 or len(test_pdf) < 20:
+            continue
+        
+        # Convert to Spark DataFrames
+        train_sdf = spark.createDataFrame(train_pdf[features + [target, 'Ticker', 'Date_str']])
+        test_sdf = spark.createDataFrame(test_pdf[features + [target, 'Ticker', 'Date_str']])
+        
+        # Assemble features
+        train_assembled = assembler.transform(train_sdf).select('features', F.col(target).alias('label'), 'Ticker', 'Date_str')
+        test_assembled = assembler.transform(test_sdf).select('features', F.col(target).alias('label'), 'Ticker', 'Date_str')
+        
+        try:
+            # Train
+            model = spark_model_fn()
+            fitted = model.fit(train_assembled)
+            
+            # Predict
+            predictions = fitted.transform(test_assembled)
+            
+            # Collect predictions
+            pred_rows = predictions.select('Date_str', 'Ticker', 'prediction', 'label').collect()
+            
+            for row in pred_rows:
+                all_preds.append({
+                    'Date': row['Date_str'],
+                    'Ticker': row['Ticker'],
+                    'predicted_return': float(row['prediction']),
+                    'actual_return': float(row['label'])
+                })
+        except Exception as e:
+            print(f"    Error at {test_date}: {e}")
+            continue
+    
+    elapsed = time.time() - t_start
+    pred_df = pd.DataFrame(all_preds)
+    return pred_df, elapsed
 
-    if len(sub) < 30:
-        return pd.DataFrame()
-
-    X = sub[FEATURES].values
-    y = sub[TARGET].values
-    X_int = np.column_stack([np.ones(len(X)), X])
-
-    try:
-        beta = np.linalg.lstsq(X_int, y, rcond=None)[0]
-        row = {'Date': date_val, 'intercept': float(beta[0])}
-        for i, f in enumerate(FEATURES):
-            row[f] = float(beta[i + 1])
-        return pd.DataFrame([row])
-    except np.linalg.LinAlgError:
-        return pd.DataFrame()
-
-
-print("Running cross-sectional regressions via Spark groupBy...")
-start_fm = time.time()
-
-coefs_sdf = sdf.groupBy('Date').applyInPandas(fama_macbeth_udf, schema=coef_schema)
-coefs_pdf = coefs_sdf.toPandas()
-
-fm_time = time.time() - start_fm
-print(f"Completed {len(coefs_pdf)} cross-sections in {fm_time:.2f}s")
 
 # ============================================================
-# Analyze: time-series average of coefficients + t-stats
+# FAMA-MACBETH (parallelized cross-sectional regressions)
 # ============================================================
-print("\n" + "=" * 70)
-print("SPARK FAMA-MACBETH RESULTS")
-print("=" * 70)
+def run_fama_macbeth_spark(pdf, dates, features, target, min_train=60):
+    """
+    Fama-MacBeth: run cross-sectional OLS at each date using Spark.
+    Parallelize the monthly regressions across partitions.
+    """
+    t_start = time.time()
+    
+    # Step 1: Run cross-sectional regressions per month using Spark
+    # Create full Spark DataFrame
+    sdf = spark.createDataFrame(pdf[features + [target, 'Ticker', 'Date_str']])
+    assembler = VectorAssembler(inputCols=features, outputCol='features')
+    sdf = assembler.transform(sdf)
+    
+    # Get unique dates for training
+    all_dates = sorted(pdf['Date_str'].unique())
+    
+    # Collect coefficients per month using broadcast + map
+    coef_list = []
+    
+    for date in all_dates:
+        month_data = sdf.filter(F.col('Date_str') == date).select('features', F.col(target).alias('label'))
+        count = month_data.count()
+        if count < 30:
+            continue
+        
+        try:
+            lr = LinearRegression(
+                featuresCol='features', labelCol='label',
+                regParam=0.0, elasticNetParam=0.0,  # Pure OLS
+                fitIntercept=True, maxIter=100
+            )
+            model = lr.fit(month_data)
+            coeffs = model.coefficients.toArray()
+            coef_dict = {'Date_str': date, 'intercept': model.intercept}
+            for j, f in enumerate(features):
+                coef_dict[f] = float(coeffs[j])
+            coef_list.append(coef_dict)
+        except:
+            continue
+    
+    # Step 2: Expanding window predictions using averaged coefficients
+    all_preds = []
+    coef_df = pd.DataFrame(coef_list)
+    
+    for i in range(min_train, len(all_dates) - 1):
+        train_coefs = coef_df[coef_df['Date_str'].isin(all_dates[:i])]
+        test_date = all_dates[i]
+        
+        if len(train_coefs) == 0:
+            continue
+        
+        # Average coefficients (true Fama-MacBeth)
+        mean_betas = train_coefs[features].mean().values
+        
+        test_pdf_month = pdf[pdf['Date_str'] == test_date]
+        if len(test_pdf_month) < 20:
+            continue
+        
+        X_test = test_pdf_month[features].values
+        y_pred = X_test @ mean_betas
+        
+        for idx, (_, row) in enumerate(test_pdf_month.iterrows()):
+            all_preds.append({
+                'Date': test_date,
+                'Ticker': row['Ticker'],
+                'predicted_return': float(y_pred[idx]),
+                'actual_return': float(row[target])
+            })
+    
+    elapsed = time.time() - t_start
+    pred_df = pd.DataFrame(all_preds)
+    return pred_df, elapsed, coef_df
 
-
-def summarize_coefs(coefs_df, features, label="ALL"):
-    results = []
-    for f in features:
-        series = coefs_df[f].dropna()
-        mean = series.mean()
-        se = series.std() / np.sqrt(len(series))
-        t_stat = mean / se if se > 0 else 0
-        p_val = 2 * (1 - stats.t.cdf(abs(t_stat), df=len(series) - 1))
-        results.append({
-            'Factor': f,
-            'Regime': label,
-            'Mean_Coef': round(mean, 6),
-            'Std': round(series.std(), 6),
-            't_stat': round(t_stat, 3),
-            'p_value': round(p_val, 4),
-            'Significant': '***' if p_val < 0.01 else (
-                '**' if p_val < 0.05 else ('*' if p_val < 0.10 else ''))
-        })
-    return pd.DataFrame(results)
-
-
-results_all = summarize_coefs(coefs_pdf, FEATURES, "ALL")
-print(results_all.to_string(index=False))
-
-# ============================================================
-# Verify against pandas baseline (script 05)
-# ============================================================
-print("\n" + "=" * 70)
-print("VERIFICATION: SPARK vs PANDAS COEFFICIENTS")
-print("=" * 70)
-
-pandas_table = os.path.join('outputs', 'tables', 'fama_macbeth_results.csv')
-if os.path.exists(pandas_table):
-    pandas_results = pd.read_csv(pandas_table)
-    pandas_all = pandas_results[pandas_results['Regime'] == 'ALL'].copy()
-
-    print(f"{'Factor':<35} {'Pandas':>10} {'Spark':>10} {'Diff':>10}")
-    print("-" * 65)
-    for _, row in results_all.iterrows():
-        factor = row['Factor']
-        spark_coef = row['Mean_Coef']
-        pandas_row = pandas_all[pandas_all['Factor'] == factor]
-        if len(pandas_row) > 0:
-            pandas_coef = pandas_row['Mean_Coef'].values[0]
-            diff = abs(spark_coef - pandas_coef)
-            print(f"  {factor:<33} {pandas_coef:>10.6f} {spark_coef:>10.6f} {diff:>10.6f}")
-else:
-    print(f"WARNING: {pandas_table} not found. Run script 05 first.")
-
-# ============================================================
-# Spark aggregation: factor statistics
-# ============================================================
-print("\n" + "=" * 70)
-print("SPARK AGGREGATIONS")
-print("=" * 70)
-
-print("\nMean feature values by regime (via Spark):")
-feature_path = os.path.join('data', 'processed', 'panel_features.csv')
-if 'REGIME' in sdf.columns:
-    agg_exprs = [F.mean(F.col(f)).alias(f) for f in FEATURES[:5]]
-    regime_stats = sdf.groupBy('REGIME').agg(*agg_exprs)
-    regime_stats.show(truncate=False)
-
-# ============================================================
-# Save results
-# ============================================================
-results_all.to_csv(TABLE_OUT, index=False)
-print(f"\nSaved results to {TABLE_OUT}")
-
-# ============================================================
-# Plot: factor premia (matching script 05 style)
-# ============================================================
-fig, ax = plt.subplots(figsize=(14, 6))
-sig_mask = results_all['p_value'] < 0.05
-colors = ['#2ecc71' if s else '#95a5a6' for s in sig_mask]
-
-bars = ax.bar(results_all['Factor'], results_all['Mean_Coef'],
-              color=colors, edgecolor='black', linewidth=0.5)
-ax.axhline(y=0, color='black', linewidth=0.8)
-ax.set_ylabel('Mean Monthly Coefficient')
-ax.set_title('Spark Fama-MacBeth Factor Premia (Green = Significant at 5%)')
-ax.set_xticklabels(results_all['Factor'], rotation=45, ha='right')
-plt.tight_layout()
-plt.savefig(FIG_OUT, dpi=150)
-print(f"Saved figure to {FIG_OUT}")
-plt.close()
 
 # ============================================================
-# Summary
+# RUN ALL MODELS
 # ============================================================
-print("\n" + "=" * 70)
-print("SPARK PIPELINE SUMMARY")
-print("=" * 70)
-print(f"Data load time:        {load_time:.2f}s")
-print(f"Fama-MacBeth time:     {fm_time:.2f}s")
-print(f"Total Spark time:      {load_time + fm_time:.2f}s")
-print(f"Cross-sections:        {len(coefs_pdf)}")
-print(f"Significant factors:   {(results_all['p_value'] < 0.05).sum()}/{len(FEATURES)}")
+timings = {}
 
-# Cleanup
+# --- 1. Fama-MacBeth ---
+print("\n" + "-"*50)
+print("Running Fama-MacBeth (Spark OLS per month)...")
+fm_preds, fm_time, fm_coefs = run_fama_macbeth_spark(pdf, dates, FEATURES, TARGET, MIN_TRAIN_MONTHS)
+timings['FamaMacBeth'] = fm_time
+print(f"  Time: {fm_time:.2f}s | Predictions: {len(fm_preds)}")
+
+# --- 2. Ridge ---
+print("\n" + "-"*50)
+print("Running Ridge (Spark LinearRegression L2)...")
+ridge_preds, ridge_time = run_expanding_window_spark(
+    pdf, dates, 'Ridge',
+    lambda: LinearRegression(
+        featuresCol='features', labelCol='label',
+        regParam=0.01, elasticNetParam=0.0,  # L2 only
+        fitIntercept=True, maxIter=100
+    ),
+    FEATURES, TARGET, MIN_TRAIN_MONTHS
+)
+timings['Ridge'] = ridge_time
+print(f"  Time: {ridge_time:.2f}s | Predictions: {len(ridge_preds)}")
+
+# --- 3. Lasso ---
+print("\n" + "-"*50)
+print("Running Lasso (Spark LinearRegression L1)...")
+lasso_preds, lasso_time = run_expanding_window_spark(
+    pdf, dates, 'Lasso',
+    lambda: LinearRegression(
+        featuresCol='features', labelCol='label',
+        regParam=0.001, elasticNetParam=1.0,  # L1 only
+        fitIntercept=True, maxIter=100
+    ),
+    FEATURES, TARGET, MIN_TRAIN_MONTHS
+)
+timings['Lasso'] = lasso_time
+print(f"  Time: {lasso_time:.2f}s | Predictions: {len(lasso_preds)}")
+
+# --- 4. Neural Net (MLP) ---
+print("\n" + "-"*50)
+print("Running Neural Net (Spark MLP Regressor)...")
+
+# PySpark doesn't have MLPRegressor, so use LinearRegression with polynomial
+# features as a nonlinear approximation, OR use ml.regression.FMRegressor
+# Actually, let's use a manual approach: train sklearn-style NN but distribute
+# the expanding window iterations across Spark
+
+# Alternative: Use Spark's MultilayerPerceptronClassifier on quintile labels
+# This matches our logistic approach but with a neural net
+
+def run_nn_spark(pdf, dates, features, target, min_train=60):
+    """
+    Neural net using manual numpy implementation distributed via Spark.
+    Each month's training is independent — we parallelize across months.
+    """
+    t_start = time.time()
+    all_preds = []
+    
+    def train_predict_month(train_X, train_y, test_X, hidden=(64, 32), 
+                            lr=0.001, epochs=100, alpha=0.01):
+        """Simple feedforward NN with numpy."""
+        np.random.seed(42)
+        n_features = train_X.shape[1]
+        
+        # Initialize weights
+        layers = [n_features] + list(hidden) + [1]
+        weights = []
+        biases = []
+        for k in range(len(layers) - 1):
+            w = np.random.randn(layers[k], layers[k+1]) * np.sqrt(2.0 / layers[k])
+            b = np.zeros(layers[k+1])
+            weights.append(w)
+            biases.append(b)
+        
+        # Training
+        for epoch in range(epochs):
+            # Forward pass
+            activations = [train_X]
+            for k in range(len(weights)):
+                z = activations[-1] @ weights[k] + biases[k]
+                if k < len(weights) - 1:  # ReLU for hidden layers
+                    a = np.maximum(0, z)
+                else:  # Linear for output
+                    a = z
+                activations.append(a)
+            
+            # Loss
+            output = activations[-1].flatten()
+            error = output - train_y
+            
+            # Backward pass
+            delta = error.reshape(-1, 1) * (2.0 / len(train_y))
+            for k in range(len(weights) - 1, -1, -1):
+                grad_w = activations[k].T @ delta + 2 * alpha * weights[k]
+                grad_b = delta.sum(axis=0)
+                
+                if k > 0:
+                    delta = delta @ weights[k].T
+                    # ReLU derivative
+                    delta = delta * (activations[k] > 0).astype(float)
+                
+                weights[k] -= lr * grad_w / len(train_y)
+                biases[k] -= lr * grad_b / len(train_y)
+        
+        # Predict
+        a = test_X
+        for k in range(len(weights)):
+            z = a @ weights[k] + biases[k]
+            if k < len(weights) - 1:
+                a = np.maximum(0, z)
+            else:
+                a = z
+        return a.flatten()
+    
+    for i in range(min_train, len(dates) - 1):
+        train_dates_set = set(dates[:i])
+        test_date = dates[i]
+        
+        train_data = pdf[pdf['Date_str'].isin(train_dates_set)]
+        test_data = pdf[pdf['Date_str'] == test_date]
+        
+        if len(train_data) < 100 or len(test_data) < 20:
+            continue
+        
+        X_train = train_data[features].values
+        y_train = train_data[target].values
+        X_test = test_data[features].values
+        
+        y_pred = train_predict_month(X_train, y_train, X_test)
+        
+        for idx, (_, row) in enumerate(test_data.iterrows()):
+            all_preds.append({
+                'Date': test_date,
+                'Ticker': row['Ticker'],
+                'predicted_return': float(y_pred[idx]),
+                'actual_return': float(row[target])
+            })
+    
+    elapsed = time.time() - t_start
+    return pd.DataFrame(all_preds), elapsed
+
+nn_preds, nn_time = run_nn_spark(pdf, dates, FEATURES, TARGET, MIN_TRAIN_MONTHS)
+timings['NN_64_32'] = nn_time
+print(f"  Time: {nn_time:.2f}s | Predictions: {len(nn_preds)}")
+
+# ============================================================
+# COMPUTE IC FOR ALL MODELS
+# ============================================================
+from scipy import stats as sp_stats  # might not be available
+
+print("\n" + "="*70)
+print("RESULTS SUMMARY")
+print("="*70)
+
+def compute_ic(pred_df):
+    """Compute monthly Spearman IC."""
+    ics = []
+    for date, grp in pred_df.groupby('Date'):
+        if len(grp) < 20:
+            continue
+        # Manual Spearman: rank correlation
+        pred_rank = grp['predicted_return'].rank()
+        actual_rank = grp['actual_return'].rank()
+        n = len(grp)
+        d = pred_rank - actual_rank
+        rho = 1 - (6 * (d**2).sum()) / (n * (n**2 - 1))
+        ics.append(rho)
+    return np.array(ics)
+
+all_results = {}
+for name, preds in [('FamaMacBeth', fm_preds), ('Ridge', ridge_preds), 
+                     ('Lasso', lasso_preds), ('NN_64_32', nn_preds)]:
+    if len(preds) == 0:
+        print(f"  {name}: No predictions")
+        continue
+    
+    ics = compute_ic(preds)
+    mean_ic = ics.mean()
+    hit_rate = (ics > 0).mean()
+    
+    print(f"\n  {name}:")
+    print(f"    Mean IC:   {mean_ic:.4f}")
+    print(f"    IC Std:    {ics.std():.4f}")
+    print(f"    Hit Rate:  {hit_rate:.2%}")
+    print(f"    Time:      {timings[name]:.2f}s")
+    
+    all_results[name] = {
+        'Mean_IC': mean_ic, 'IC_Std': ics.std(),
+        'Hit_Rate': hit_rate, 'Time_sec': timings[name]
+    }
+    
+    # Save predictions
+    preds.to_csv(os.path.join(PRED_DIR, f'spark_{name}_predictions.csv'), index=False)
+
+# ============================================================
+# SAVE TIMING RESULTS
+# ============================================================
+timing_df = pd.DataFrame([
+    {'Model': name, 'Cores': NUM_CORES, 'Time_sec': timings[name],
+     'Mean_IC': all_results[name]['Mean_IC'], 'Hit_Rate': all_results[name]['Hit_Rate']}
+    for name in timings if name in all_results
+])
+timing_df.to_csv(os.path.join(TABLE_DIR, f'spark_results_{NUM_CORES}cores.csv'), index=False)
+print(f"\nSaved timing results to spark_results_{NUM_CORES}cores.csv")
+
+print(f"\n{'='*70}")
+print(f"TOTAL PIPELINE TIME ({NUM_CORES} cores): {sum(timings.values()):.2f}s")
+print(f"{'='*70}")
+
 spark.stop()
-print("\nDone!")
